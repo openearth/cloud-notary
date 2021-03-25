@@ -1,0 +1,106 @@
+# Workflow to run GTSM model
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: tki2021-
+spec:
+  entrypoint: gtsm
+  arguments:
+    parameters:
+    - name: uuid
+      value: "tki2021"
+    - name: pre-json
+      value: '{"buoy_file":"/data/buoy/ADCP_data.nc", "startdatestr":{"value":20170205},"stopdatestr":{"value":20170215},"bbox":{"value":[-78,-70.75,36,42]},"extra_bpoints":{"value":[{"label":"extra1","coords":[22.45, 40.75]},{"label":"extra2","coords":[15.45, 10.75]}]},"dTmaps":{"value":30}}'
+    - name: post-json
+      value: '{"obsfile":"/data/buoy/ADCP_data.nc", "case": "/data/sim/", "quantity_mod":"vel_mag", "quantity_obs":"vel_mag_dav", "bbox":[-78,-70.75,36,42]}'
+    - name: buoy-mat
+      value: '/data/buoy/D0.mat'
+    - name: buoy-nc
+      value: '/data/buoy/ADCP_data.nc'
+  imagePullSecrets:
+    - name: privateA
+  volumes:
+  - name: gtsm-storage
+    persistentVolumeClaim:
+      claimName: meteoshare
+  - name: buoy-storage
+    persistentVolumeClaim:
+      claimName: Bdata
+  templates:
+  - name: gtsm
+    steps:
+    - - name: preprocess-buoy
+        template: preprocess-buoy
+    - - name: preprocess
+        template: preprocess
+    - - name: delft3dfm
+        template: delft3dfm
+    - - name: postprocess
+        template: postprocess
+
+  - name: gtsm-postprocessing
+    steps:
+    - - name: postprocess
+        template: postprocess
+
+  # preprcessing containers => dflowfm simulation input
+  - name: preprocess-buoy
+    container:
+      image: A/delft3d-gt-dockerfiles:python2.7-gtsm
+      command: [python]
+      args: ["/data/scripts/VO_data_read.py", "{{workflow.parameters.buoy-mat}}", "{{workflow.parameters.buoy-nc}}"]
+      volumeMounts:
+      - name: gtsm-storage
+        mountPath: "/data/scripts"
+        subPath: "data/static/preprocessing"
+      - name: buoy-storage
+        mountPath: "/data/buoy"
+
+  # preprcessing containers => dflowfm simulation input
+  - name: preprocess
+    container:
+      image: A/delft3d-gt-dockerfiles:python2.7-gtsm
+      command: [python]
+      args: ["/data/scripts/prepare_runs_ERA5_buoy.py", "{{workflow.parameters.pre-json}}"]
+      volumeMounts:
+      - name: gtsm-storage
+        mountPath: "/data/scripts"
+        subPath: "data/static/preprocessing"
+      - name: gtsm-storage
+        mountPath: "/data/meteo"
+        subPath: "data/static/meteo"
+      - name: gtsm-storage
+        mountPath: "/data/output"
+        subPath: "data/dynamic/{{workflow.parameters.uuid}}"
+      - name: buoy-storage
+        mountPath: "/data/buoy"
+
+  # dflowfm gtsm simulation
+  - name: delft3dfm
+    container:
+      image: A/delft3dfm:1.4.99.56
+      command:
+      args:
+      volumeMounts:
+      - name: gtsm-storage
+        mountPath: "/data"
+        subPath: "data/dynamic/{{workflow.parameters.uuid}}/simulation"
+      - name: gtsm-storage
+        mountPath: "/data/meteo"
+        subPath: "data/static/meteo"
+
+  # postprocessing container => images
+  - name: postprocess
+    container:
+      image: A/delft3d-gt-dockerfiles:python2.7-gtsm
+      command: [python]
+      args: ["/data/scripts/postprocess_main_2.py", "{{workflow.parameters.post-json}}" ]
+      volumeMounts:
+      - name: gtsm-storage
+        mountPath: "/data/scripts"
+        subPath: "data/static/postprocessing"
+      - name: gtsm-storage
+        mountPath: "/data/sim"
+        subPath: "data/dynamic/{{workflow.parameters.uuid}}/simulation"
+      - name: buoy-storage
+        mountPath: "/data/buoy"

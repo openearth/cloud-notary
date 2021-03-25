@@ -1,0 +1,227 @@
+# Starter pipeline
+# Start with a minimal pipeline that you can customize to build and deploy your code.
+# Add steps that build, run tests, deploy, and more:
+# https://aka.ms/yaml
+
+trigger:
+- master
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+
+# Set variables once
+variables:
+  region: westeurope
+  resource_group: unreachable-group
+  kubernetes_cluster_name: unreachable-cluster
+  kube_subscription: 'notary'
+
+steps:
+
+# Register $(appId) and $(password) for access to A registry
+# also includes $(dockerhub-*) and $(meteodata)
+- task: AzureKeyVault@1
+  displayName: 'Retrieve A secrets'
+  inputs:
+    azureSubscription: 'Private A'
+    KeyVaultName: 'acrsecret'
+    SecretsFilter: '*'
+
+# Register $(kubeappid) and $(kubeapppassword) serviceprincipal to create kubernetes cluster
+- task: AzureKeyVault@1
+  displayName: 'Retrieve service principal'
+  inputs:
+    azureSubscription: $(kube_subscription)
+    KeyVaultName: 'tkikubernetes'
+    SecretsFilter: '*'
+
+# service principal and $(storageB) B filesystem
+- task: AzureKeyVault@1
+  displayName: 'Retrieve B secrets'
+  inputs:
+    azureSubscription: 'notary'
+    KeyVaultName: 'Bv2'
+    SecretsFilter: '*'
+
+- task: AzureCLI@1
+  displayName: 'Create resource group'
+  inputs:
+    azureSubscription: $(kube_subscription)
+    scriptLocation: 'inlineScript'
+    inlineScript: 'az group create -l $(region) -n $(resource_group)'
+
+# Check available versions: az aks get-versions --location westeurope
+- task: AzureCLI@1
+  displayName: 'Create AKS managed kubernetes cluster'
+  inputs:
+    azureSubscription: $(kube_subscription)
+    scriptLocation: 'inlineScript'
+    inlineScript: 'az aks create -l $(region) -n $(kubernetes_cluster_name) -g $(resource_group) --no-ssh-key -k 1.17.13 --service-principal $(kubeappid) --client-secret $(kubeapppassword) --node-vm-size Standard_A8m_v2 --node-count 1'
+
+- task: KubectlInstaller@0
+  displayName: 'Install kubectl'
+  inputs:
+    kubectlVersion: 'latest'
+
+- task: HelmInstaller@1
+  displayName: 'Install helm'
+  inputs:
+    helmVersionToInstall: '2.14.1'
+
+- task: Bash@3
+  displayName: 'Install argo commandline'
+  inputs:
+    targetType: 'inline'
+    script: |
+      curl -sLO https://github.com/argoproj/argo/releases/download/v2.7.1/argo-linux-amd64
+      chmod +x argo-linux-amd64
+      echo $(pwd)
+      mv ./argo-linux-amd64 $(pwd)/argo
+      ./argo version
+
+- task: Kubernetes@1
+  displayName: 'Create argo namespace in kubernetes'
+  continueOnError: true
+  inputs:
+    connectionType: 'Azure Resource Manager'
+    azureSubscriptionEndpoint: $(kube_subscription)
+    azureResourceGroup: $(resource_group)
+    kubernetesCluster: $(kubernetes_cluster_name)
+    command: 'create'
+    arguments: 'ns argo'
+    secretType: 'dockerRegistry'
+    containerRegistryType: 'Azure Container Registry'
+
+- task: Kubernetes@1
+  displayName: 'Install argo in kubernetes'
+  inputs:
+    connectionType: 'Azure Resource Manager'
+    azureSubscriptionEndpoint: $(kube_subscription)
+    azureResourceGroup: $(resource_group)
+    kubernetesCluster: $(kubernetes_cluster_name)
+    useClusterAdmin: true
+    namespace: 'argo'
+    command: 'apply'
+    arguments: '-f https://raw.githubusercontent.com/argoproj/argo/v2.7.1/manifests/install.yaml'
+
+- task: Kubernetes@1
+  displayName: 'Add container secret to Kubernetes'
+  continueOnError: true
+  inputs:
+    connectionType: 'Azure Resource Manager'
+    azureSubscriptionEndpoint: $(kube_subscription)
+    azureResourceGroup: $(resource_group)
+    kubernetesCluster: $(kubernetes_cluster_name)
+    useClusterAdmin: true
+    command: 'create'
+    arguments: 'secret docker-registry privateazure --docker-server privateA.azurecr.io --docker-username=$(appId) --docker-password=$(password)'
+
+
+- task: Kubernetes@1
+  displayName: 'Add container secret to Kubernetes'
+  continueOnError: true
+  inputs:
+    connectionType: 'Azure Resource Manager'
+    azureSubscriptionEndpoint: $(kube_subscription)
+    azureResourceGroup: $(resource_group)
+    kubernetesCluster: $(kubernetes_cluster_name)
+    useClusterAdmin: true
+    command: 'create'
+    arguments: 'secret docker-registry privateA --docker-server https://index.docker.io/v1/ --docker-username=$(dockerhub-user) --docker-password=$(dockerhub-pass) --docker-email=$(dockerhub-email)'
+
+- task: Kubernetes@1
+  displayName: 'Add storage secret to Kubernetes'
+  continueOnError: true
+  inputs:
+    connectionType: 'Azure Resource Manager'
+    azureSubscriptionEndpoint: $(kube_subscription)
+    azureResourceGroup: $(resource_group)
+    kubernetesCluster: $(kubernetes_cluster_name)
+    useClusterAdmin: true
+    command: 'create'
+    arguments: 'secret generic b-storage-secret --from-literal=azurestorageaccountname=Bdata --from-literal=azurestorageaccountkey=$(storageB)'
+
+- task: Kubernetes@1
+  displayName: 'Add meteo storage secret to Kubernetes'
+  continueOnError: true
+  inputs:
+    connectionType: 'Azure Resource Manager'
+    azureSubscriptionEndpoint: $(kube_subscription)
+    azureResourceGroup: $(resource_group)
+    kubernetesCluster: $(kubernetes_cluster_name)
+    useClusterAdmin: true
+    command: 'create'
+    arguments: 'secret generic meteo-storage-secret --from-literal=azurestorageaccountname=meteostorage --from-literal=azurestorageaccountkey=$(meteo-storage-secret)'
+
+- task: Kubernetes@1
+  displayName: 'Create PV  in Kubernetes'
+  inputs:
+    connectionType: 'Azure Resource Manager'
+    azureSubscriptionEndpoint: $(kube_subscription)
+    azureResourceGroup: $(resource_group)
+    kubernetesCluster: $(kubernetes_cluster_name)
+    useClusterAdmin: true
+    command: 'apply'
+    arguments: '-f $(Build.SourcesDirectory)/azure-files-pv.yml --wait'
+
+- task: Kubernetes@1
+  displayName: 'Create PV  in Kubernetes'
+  inputs:
+    connectionType: 'Azure Resource Manager'
+    azureSubscriptionEndpoint: $(kube_subscription)
+    azureResourceGroup: $(resource_group)
+    kubernetesCluster: $(kubernetes_cluster_name)
+    useClusterAdmin: true
+    command: 'apply'
+    arguments: '-f $(Build.SourcesDirectory)/azure-files-pv-meteo.yml --wait'
+
+- task: Kubernetes@1
+  displayName: 'Create PVC in Kubernetes'
+  inputs:
+    connectionType: 'Azure Resource Manager'
+    azureSubscriptionEndpoint: $(kube_subscription)
+    azureResourceGroup: $(resource_group)
+    kubernetesCluster: $(kubernetes_cluster_name)
+    useClusterAdmin: true
+    command: 'apply'
+    arguments: '-f $(Build.SourcesDirectory)/azure-files-pvc.yml --wait'
+
+- task: Kubernetes@1
+  displayName: 'Create PVC in Kubernetes'
+  inputs:
+    connectionType: 'Azure Resource Manager'
+    azureSubscriptionEndpoint: $(kube_subscription)
+    azureResourceGroup: $(resource_group)
+    kubernetesCluster: $(kubernetes_cluster_name)
+    useClusterAdmin: true
+    command: 'apply'
+    arguments: '-f $(Build.SourcesDirectory)/azure-files-pvc-meteo.yml --wait'
+
+- task: Kubernetes@1
+  displayName: 'Run gtsm model'
+  inputs:
+    connectionType: 'Azure Resource Manager'
+    azureSubscriptionEndpoint: $(kube_subscription)
+    azureResourceGroup: $(resource_group)
+    kubernetesCluster: $(kubernetes_cluster_name)
+    useClusterAdmin: true
+    command: 'login'
+
+- task: Bash@3
+  displayName: 'Get argo workflows'
+  inputs:
+    targetType: 'inline'
+    script: |
+      ./argo list
+
+- task: Kubernetes@1
+  displayName: 'Run gtsm model'
+  inputs:
+    connectionType: 'Azure Resource Manager'
+    azureSubscriptionEndpoint: $(kube_subscription)
+    azureResourceGroup: $(resource_group)
+    kubernetesCluster: $(kubernetes_cluster_name)
+    useClusterAdmin: true
+    command: 'apply'
+    arguments: '-f $(Build.SourcesDirectory)/gtsm.yaml --wait'
